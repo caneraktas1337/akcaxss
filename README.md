@@ -89,8 +89,9 @@ This tool is intended for **authorized security testing only**. The author is no
 
 ## Author
 
-**caneraktas1337** — [github.com/caneraktas1337](https://github.com/caneraktas1337)
+**Caner Aktaş**
 
 ## License
 
 MIT
+
