@@ -23,8 +23,11 @@ readonly -a USER_AGENTS=(
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
 )
 
-CONCURRENCY=15
-DELAY=300
+DEFAULT_CONCURRENCY=30
+DEFAULT_DELAY=0
+CONCURRENCY="${AKCAXSS_CONCURRENCY:-${DEFAULT_CONCURRENCY}}"
+DELAY="${AKCAXSS_DELAY:-${DEFAULT_DELAY}}"
+BATCH_SIZE="${AKCAXSS_BATCH_SIZE:-0}"
 FAILURE_COUNT=0
 FAILURE_THRESHOLD=20
 WAF_DETECTED=0
@@ -217,7 +220,6 @@ build_extension_filter() {
 run_gospider() {
     local domain="$1"
     local outfile="${TEMP_DIR}/gospider_out.txt"
-    log_info "Running gospider on ${domain}..."
     gospider -s "https://${domain}" -d 3 -c 10 -t 5 --other-source --include-subs \
         -H "User-Agent: $(random_ua)" \
         -o "${TEMP_DIR}/gospider_raw" >/dev/null 2>&1 || true
@@ -226,55 +228,44 @@ run_gospider() {
         rm -rf "${TEMP_DIR}/gospider_raw"
     fi
     [[ -f "${outfile}" ]] || touch "${outfile}"
-    log_success "gospider collected $(wc -l < "${outfile}") URLs"
 }
 
 run_katana() {
     local domain="$1"
     local outfile="${TEMP_DIR}/katana_out.txt"
-    log_info "Running katana on ${domain}..."
     katana -u "https://${domain}" -d 3 -jc -kf all -c 10 -silent \
         -H "User-Agent: $(random_ua)" \
         -o "${outfile}" 2>/dev/null || true
     [[ -f "${outfile}" ]] || touch "${outfile}"
-    log_success "katana collected $(wc -l < "${outfile}") URLs"
 }
 
 run_waybackurls() {
     local domain="$1"
     local outfile="${TEMP_DIR}/waybackurls_out.txt"
-    log_info "Running waybackurls on ${domain}..."
     printf "%s\n" "${domain}" | waybackurls > "${outfile}" 2>/dev/null || true
     [[ -f "${outfile}" ]] || touch "${outfile}"
-    log_success "waybackurls collected $(wc -l < "${outfile}") URLs"
 }
 
 run_gau() {
     local domain="$1"
     local outfile="${TEMP_DIR}/gau_out.txt"
-    log_info "Running gau on ${domain}..."
     printf "%s\n" "${domain}" | gau --threads 5 > "${outfile}" 2>/dev/null || true
     [[ -f "${outfile}" ]] || touch "${outfile}"
-    log_success "gau collected $(wc -l < "${outfile}") URLs"
 }
 
 run_hakrawler() {
     local domain="$1"
     local outfile="${TEMP_DIR}/hakrawler_out.txt"
-    log_info "Running hakrawler on ${domain}..."
     printf "https://%s\n" "${domain}" | hakrawler -d 3 -t 5 -subs \
         -h "User-Agent: $(random_ua)" > "${outfile}" 2>/dev/null || true
     [[ -f "${outfile}" ]] || touch "${outfile}"
-    log_success "hakrawler collected $(wc -l < "${outfile}") URLs"
 }
 
 run_urlfinder() {
     local domain="$1"
     local outfile="${TEMP_DIR}/urlfinder_out.txt"
-    log_info "Running urlfinder on ${domain}..."
     urlfinder -d "${domain}" -all -silent -o "${outfile}" 2>/dev/null || true
     [[ -f "${outfile}" ]] || touch "${outfile}"
-    log_success "urlfinder collected $(wc -l < "${outfile}") URLs"
 }
 
 merge_urls() {
@@ -333,7 +324,6 @@ extract_parameterized() {
 
 run_paramspider() {
     local domain="$1"
-    log_info "Running ParamSpider on ${domain}..."
     local ps_out="${TEMP_DIR}/paramspider_out.txt"
     if check_command "paramspider"; then
         paramspider -d "${domain}" --level high -o "${ps_out}" 2>/dev/null || true
@@ -398,6 +388,12 @@ pre_scan_waf_check() {
 
     if [[ ${WAF_DETECTED} -eq 1 ]]; then
         log_warn "WAF detected during pre-scan. Using conservative settings."
+        if [[ ${CONCURRENCY} -gt 6 ]]; then
+            CONCURRENCY=6
+        fi
+        if [[ ${DELAY} -lt 800 ]]; then
+            DELAY=800
+        fi
     else
         log_success "No immediate WAF detection. Proceeding with standard settings."
     fi
@@ -432,7 +428,13 @@ run_dalfox() {
         return 0
     fi
 
-    log_info "Scanning ${candidate_count} URLs with dalfox (worker=${CONCURRENCY}, delay=${DELAY}ms)..."
+    local batch_size=${BATCH_SIZE}
+    if [[ ${batch_size} -le 0 ]]; then
+        batch_size=$(( CONCURRENCY * 4 ))
+        [[ ${batch_size} -lt 50 ]] && batch_size=50
+        [[ ${batch_size} -gt 500 ]] && batch_size=500
+    fi
+    log_info "Scanning ${candidate_count} URLs with dalfox (worker=${CONCURRENCY}, delay=${DELAY}ms, batch=${batch_size})..."
     if [[ -n "${PROXY}" ]]; then
         log_info "Using proxy: ${PROXY}"
     fi
@@ -443,10 +445,14 @@ run_dalfox() {
     local total_waf_hits=0
     local batch_file="${TEMP_DIR}/dalfox_batch.txt"
     local batch_out="${TEMP_DIR}/dalfox_batch_out.json"
-    local batch_size=${CONCURRENCY}
     local line_num=0
 
-    draw_progress 0 "${candidate_count}" 0
+    local show_payloads=1
+    if [[ ${show_payloads} -eq 1 ]]; then
+        : > "${OUTPUT_DIR}/dalfox_payloads.log"
+    else
+        draw_progress 0 "${candidate_count}" 0
+    fi
 
     > "${batch_file}"
     local batch_count=0
@@ -458,19 +464,23 @@ run_dalfox() {
 
         if [[ ${batch_count} -ge ${batch_size} ]]; then
             local dalfox_cmd=(dalfox file "${batch_file}"
-                --only-poc r
-                --silence
-                --skip-bav
-                --skip-mining-dom
                 --format json
                 --output "${batch_out}"
-                --worker "${CONCURRENCY}"
-                --delay "${DELAY}"
                 -H "User-Agent: $(random_ua)"
             )
+            if [[ -n "${AKCAXSS_CONCURRENCY:-}" ]]; then
+                dalfox_cmd+=(--worker "${CONCURRENCY}")
+            fi
+            if [[ -n "${AKCAXSS_DELAY:-}" ]]; then
+                dalfox_cmd+=(--delay "${DELAY}")
+            fi
             [[ -n "${PROXY}" ]] && dalfox_cmd+=(--proxy "${PROXY}")
 
-            "${dalfox_cmd[@]}" 2>"${TEMP_DIR}/dalfox_stderr.txt" || true
+            if [[ ${show_payloads} -eq 1 ]]; then
+                "${dalfox_cmd[@]}" 2>"${TEMP_DIR}/dalfox_stderr.txt" | tee -a "${OUTPUT_DIR}/dalfox_payloads.log" || true
+            else
+                "${dalfox_cmd[@]}" 2>"${TEMP_DIR}/dalfox_stderr.txt" || true
+            fi
 
             if [[ -f "${batch_out}" ]] && [[ -s "${batch_out}" ]]; then
                 local new_findings
@@ -483,14 +493,16 @@ run_dalfox() {
 
             if [[ -f "${TEMP_DIR}/dalfox_stderr.txt" ]]; then
                 local waf_hits
-                waf_hits=$(grep -ciE '403|429|forbidden|rate.limit' "${TEMP_DIR}/dalfox_stderr.txt" 2>/dev/null | head -1 || echo "0")
+                waf_hits=$(grep -ciE '403|429|forbidden|rate.limit' "${TEMP_DIR}/dalfox_stderr.txt" 2>/dev/null || true)
                 waf_hits=$(( waf_hits + 0 ))
                 total_waf_hits=$(( total_waf_hits + waf_hits ))
             fi
 
             scanned=$(( scanned + batch_count ))
             [[ ${scanned} -gt ${candidate_count} ]] && scanned=${candidate_count}
-            draw_progress "${scanned}" "${candidate_count}" "${xss_found}"
+            if [[ ${show_payloads} -ne 1 ]]; then
+                draw_progress "${scanned}" "${candidate_count}" "${xss_found}"
+            fi
 
             > "${batch_file}"
             batch_count=0
@@ -499,19 +511,23 @@ run_dalfox() {
 
     if [[ ${batch_count} -gt 0 ]]; then
         local dalfox_cmd=(dalfox file "${batch_file}"
-            --only-poc r
-            --silence
-            --skip-bav
-            --skip-mining-dom
             --format json
             --output "${batch_out}"
-            --worker "${CONCURRENCY}"
-            --delay "${DELAY}"
             -H "User-Agent: $(random_ua)"
         )
+        if [[ -n "${AKCAXSS_CONCURRENCY:-}" ]]; then
+            dalfox_cmd+=(--worker "${CONCURRENCY}")
+        fi
+        if [[ -n "${AKCAXSS_DELAY:-}" ]]; then
+            dalfox_cmd+=(--delay "${DELAY}")
+        fi
         [[ -n "${PROXY}" ]] && dalfox_cmd+=(--proxy "${PROXY}")
 
-        "${dalfox_cmd[@]}" 2>"${TEMP_DIR}/dalfox_stderr.txt" || true
+        if [[ ${show_payloads} -eq 1 ]]; then
+            "${dalfox_cmd[@]}" 2>"${TEMP_DIR}/dalfox_stderr.txt" | tee -a "${OUTPUT_DIR}/dalfox_payloads.log" || true
+        else
+            "${dalfox_cmd[@]}" 2>"${TEMP_DIR}/dalfox_stderr.txt" || true
+        fi
 
         if [[ -f "${batch_out}" ]] && [[ -s "${batch_out}" ]]; then
             local new_findings
@@ -524,7 +540,7 @@ run_dalfox() {
 
         if [[ -f "${TEMP_DIR}/dalfox_stderr.txt" ]]; then
             local waf_hits
-            waf_hits=$(grep -ciE '403|429|forbidden|rate.limit' "${TEMP_DIR}/dalfox_stderr.txt" 2>/dev/null | head -1 || echo "0")
+            waf_hits=$(grep -ciE '403|429|forbidden|rate.limit' "${TEMP_DIR}/dalfox_stderr.txt" 2>/dev/null || true)
             waf_hits=$(( waf_hits + 0 ))
             total_waf_hits=$(( total_waf_hits + waf_hits ))
         fi
@@ -533,8 +549,10 @@ run_dalfox() {
         [[ ${scanned} -gt ${candidate_count} ]] && scanned=${candidate_count}
     fi
 
-    draw_progress "${candidate_count}" "${candidate_count}" "${xss_found}"
-    printf "\n"
+    if [[ ${show_payloads} -ne 1 ]]; then
+        draw_progress "${candidate_count}" "${candidate_count}" "${xss_found}"
+        printf "\n"
+    fi
 
     if [[ -f "${TEMP_DIR}/dalfox_all_results.json" ]] && [[ -s "${TEMP_DIR}/dalfox_all_results.json" ]]; then
         cp "${TEMP_DIR}/dalfox_all_results.json" "${OUTPUT_DIR}/dalfox.json"
@@ -887,6 +905,8 @@ AUDITHEAD
 
     local eval_count
     eval_count=$(grep -c 'eval ' "${script_path}" 2>/dev/null | head -1 || echo "0")
+    eval_count=${eval_count//[^0-9]/}
+    [[ -z "${eval_count}" ]] && eval_count=0
     eval_count=$(( eval_count + 0 ))
     if [[ ${eval_count} -eq 0 ]]; then
         printf "  [PASS] No eval statements found — no eval-based injection risk\n" >> "${audit_file}"
@@ -897,6 +917,8 @@ AUDITHEAD
 
     local backtick_count
     backtick_count=$(grep -c '`' "${script_path}" 2>/dev/null | head -1 || echo "0")
+    backtick_count=${backtick_count//[^0-9]/}
+    [[ -z "${backtick_count}" ]] && backtick_count=0
     backtick_count=$(( backtick_count + 0 ))
     if [[ ${backtick_count} -eq 0 ]]; then
         printf "  [PASS] No backtick command substitution — uses safe \$() syntax\n" >> "${audit_file}"
@@ -938,6 +960,8 @@ AUDITHEAD
 
     local bg_count
     bg_count=$(grep -c '&$' "${script_path}" 2>/dev/null | head -1 || echo "0")
+    bg_count=${bg_count//[^0-9]/}
+    [[ -z "${bg_count}" ]] && bg_count=0
     bg_count=$(( bg_count + 0 ))
     if [[ ${bg_count} -le 2 ]]; then
         printf "  [PASS] Minimal background processes — low race condition risk\n" >> "${audit_file}"
@@ -954,6 +978,8 @@ AUDITHEAD
 
     local or_true_count
     or_true_count=$(grep -c '|| true' "${script_path}" 2>/dev/null | head -1 || echo "0")
+    or_true_count=${or_true_count//[^0-9]/}
+    [[ -z "${or_true_count}" ]] && or_true_count=0
     or_true_count=$(( or_true_count + 0 ))
     printf "  [INFO] %d defensive '|| true' guards found for non-critical commands\n" "${or_true_count}" >> "${audit_file}"
 
@@ -992,6 +1018,8 @@ AUDITHEAD
 
     local unquoted
     unquoted=$(grep -cE '\$[A-Z_]+[^"}\]]' "${script_path}" 2>/dev/null | head -1 || echo "0")
+    unquoted=${unquoted//[^0-9]/}
+    [[ -z "${unquoted}" ]] && unquoted=0
     unquoted=$(( unquoted + 0 ))
     if [[ ${unquoted} -lt 5 ]]; then
         printf "  [PASS] Variables appear properly quoted throughout\n" >> "${audit_file}"
@@ -1108,6 +1136,9 @@ main() {
         printf "  %s --tool-install    Install all required tools\n" "$0"
         printf "\nEnvironment variables:\n"
         printf "  AKCAXSS_PROXY        HTTP proxy (e.g. http://127.0.0.1:8080)\n"
+        printf "  AKCAXSS_CONCURRENCY  Dalfox worker count (default: %s)\n" "${DEFAULT_CONCURRENCY}"
+        printf "  AKCAXSS_DELAY        Dalfox delay in ms (default: %s)\n" "${DEFAULT_DELAY}"
+        printf "  AKCAXSS_BATCH_SIZE   Dalfox batch size (0=auto, default: 0)\n"
         printf "\nExample:\n"
         printf "  %s example.com\n" "$0"
         exit 1
@@ -1123,6 +1154,11 @@ main() {
             printf "Usage:\n"
             printf "  %s <domain>          Run XSS scan on target domain\n" "$0"
             printf "  %s --tool-install    Install all required tools\n" "$0"
+            printf "\nEnvironment variables:\n"
+            printf "  AKCAXSS_PROXY        HTTP proxy (e.g. http://127.0.0.1:8080)\n"
+            printf "  AKCAXSS_CONCURRENCY  Dalfox worker count (default: %s)\n" "${DEFAULT_CONCURRENCY}"
+            printf "  AKCAXSS_DELAY        Dalfox delay in ms (default: %s)\n" "${DEFAULT_DELAY}"
+            printf "  AKCAXSS_BATCH_SIZE   Dalfox batch size (0=auto, default: 0)\n"
             exit 0
             ;;
         -*)
